@@ -274,7 +274,9 @@ def cmd_deploy(args):
 
     # Step 3: Bring up the stack
     print("Starting stack...")
-    run(["docker", "compose", "up", "-d"])
+    result = run(["docker", "compose", "up", "-d"], check=False)
+    if result.returncode != 0:
+        print("[WARNING] docker compose up reported errors, checking health anyway...")
 
     # Step 4: Wait for health checks
     nginx_port = manifest["nginx"]["port"]

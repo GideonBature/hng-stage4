@@ -193,12 +193,21 @@ def cmd_validate(args):
     # Check 4: Nginx port not already bound
     if manifest:
         nginx_port = manifest["nginx"]["port"]
+        # Check if port is in use by something other than our own nginx
+        result = run(
+            ["docker", "ps", "--filter", f"name=swiftdeploy-nginx",
+             "--filter", f"publish={nginx_port}", "--format", "{{.Names}}"],
+            check=False,
+            capture=True,
+        )
+        our_nginx_running = result.stdout.strip() == "swiftdeploy-nginx"
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(1)
-        result = sock.connect_ex(("127.0.0.1", nginx_port))
+        in_use = sock.connect_ex(("127.0.0.1", nginx_port)) == 0
         sock.close()
-        if result == 0:
-            print_fail(f"Port {nginx_port} is already in use on the host")
+
+        if in_use and not our_nginx_running:
+            print_fail(f"Port {nginx_port} is already in use by another process")
             failed += 1
         else:
             print_ok(f"Nginx port {nginx_port} is available")

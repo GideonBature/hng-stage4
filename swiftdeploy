@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""
+swiftdeploy - declarative container deployment CLI.
+
+Reads manifest.yaml and generates all infrastructure configs from templates.
+The manifest is the single source of truth. Nothing is handwritten.
+
+Subcommands:
+  init      Parse manifest, generate nginx.conf and docker-compose.yml
+  validate  Run 5 pre-flight checks before deployment
+  deploy    Run init, bring up the stack, wait for health checks
+  promote   Switch between stable and canary mode with rolling restart
+  teardown  Remove all containers, networks, and volumes
+"""
+
+import sys
+import os
+import time
+import socket
+import subprocess
+import shutil
+import argparse
+import re
+
+try:
+    import yaml
+except ImportError:
+    print("[ERROR] PyYAML not installed. Run: pip install pyyaml jinja2 requests")
+    sys.exit(1)
+
+try:
+    from jinja2 import Environment, FileSystemLoader
+except ImportError:
+    print("[ERROR] Jinja2 not installed. Run: pip install pyyaml jinja2 requests")
+    sys.exit(1)
+
+try:
+    import requests
+except ImportError:
+    print("[ERROR] requests not installed. Run: pip install pyyaml jinja2 requests")
+    sys.exit(1)
+
+MANIFEST_PATH = "manifest.yaml"
+NGINX_CONF_OUT = "nginx.conf"
+COMPOSE_OUT = "docker-compose.yml"
+TEMPLATES_DIR = "templates"
+SERVICE_NAME = "swiftdeploy-app"
+HEALTH_TIMEOUT = 60
+
+
+def load_manifest():
+    """Load and return the manifest.yaml as a dict."""
+    with open(MANIFEST_PATH, "r") as f:
+        return yaml.safe_load(f)
+
+
+def save_manifest(manifest: dict):
+    """Write manifest back to disk preserving structure."""
+    with open(MANIFEST_PATH, "w") as f:
+        yaml.dump(manifest, f, default_flow_style=False, sort_keys=False)
+
+
+def render_template(template_name: str, context: dict) -> str:
+    """Render a Jinja2 template with the given context."""
+    env = Environment(
+        loader=FileSystemLoader(TEMPLATES_DIR),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+    template = env.get_template(template_name)
+    return template.render(**context)
+
+
+def get_template_context(manifest: dict) -> dict:
+    """Build the template rendering context from the manifest."""
+    return {
+        "services": manifest["services"],
+        "nginx": manifest["nginx"],
+        "network": manifest["network"],
+        "service_name": SERVICE_NAME,
+    }
+
+
+def run(cmd: list, check=True, capture=False):
+    """Run a shell command."""
+    result = subprocess.run(
+        cmd,
+        check=check,
+        capture_output=capture,
+        text=True,
+    )
+    return result
+
+
+def print_ok(msg: str):
+    print(f"  [PASS] {msg}")
+
+
+def print_fail(msg: str):
+    print(f"  [FAIL] {msg}")
+
+
+def cmd_init(args):
+    """
+    Parse manifest.yaml and generate nginx.conf and docker-compose.yml
+    from Jinja2 templates.
+    """
+    print("Running init...")
+
+    manifest = load_manifest()
+    context = get_template_context(manifest)
+
+    # Generate nginx.conf
+    nginx_content = render_template("nginx.conf.j2", context)
+    with open(NGINX_CONF_OUT, "w") as f:
+        f.write(nginx_content)
+    print(f"  Generated {NGINX_CONF_OUT}")
+
+    # Generate docker-compose.yml
+    compose_content = render_template("docker-compose.yml.j2", context)
+    with open(COMPOSE_OUT, "w") as f:
+        f.write(compose_content)
+    print(f"  Generated {COMPOSE_OUT}")
+
+    print("Init complete.")
+
+
+def cmd_validate(args):
+    """
+    Run 5 pre-flight checks. Exit non-zero if any fail.
+
+    Checks:
+    1. manifest.yaml exists and is valid YAML
+    2. All required fields are present and non-empty
+    3. Docker image referenced in manifest exists locally
+    4. Nginx port is not already bound on the host
+    5. Generated nginx.conf is syntactically valid
+    """
+    print("Running validate...")
+    passed = 0
+    failed = 0
+
+    # Check 1: manifest.yaml exists and is valid YAML
+    try:
+        manifest = load_manifest()
+        print_ok("manifest.yaml exists and is valid YAML")
+        passed += 1
+    except FileNotFoundError:
+        print_fail("manifest.yaml not found")
+        failed += 1
+        manifest = None
+    except yaml.YAMLError as e:
+        print_fail(f"manifest.yaml is invalid YAML: {e}")
+        failed += 1
+        manifest = None
+
+    # Check 2: Required fields present and non-empty
+    if manifest:
+        required = {
+            "services.image": manifest.get("services", {}).get("image"),
+            "services.port": manifest.get("services", {}).get("port"),
+            "nginx.image": manifest.get("nginx", {}).get("image"),
+            "nginx.port": manifest.get("nginx", {}).get("port"),
+            "network.name": manifest.get("network", {}).get("name"),
+            "network.driver_type": manifest.get("network", {}).get("driver_type"),
+        }
+        missing = [k for k, v in required.items() if not v]
+        if missing:
+            print_fail(f"Missing required fields: {', '.join(missing)}")
+            failed += 1
+        else:
+            print_ok("All required manifest fields present and non-empty")
+            passed += 1
+    else:
+        print_fail("Skipping field check (manifest invalid)")
+        failed += 1
+
+    # Check 3: Docker image exists locally
+    if manifest:
+        image = manifest["services"]["image"]
+        result = run(
+            ["docker", "image", "inspect", image],
+            check=False,
+            capture=True,
+        )
+        if result.returncode == 0:
+            print_ok(f"Docker image '{image}' exists locally")
+            passed += 1
+        else:
+            print_fail(f"Docker image '{image}' not found locally. Run: docker build -t {image} app/")
+            failed += 1
+
+    # Check 4: Nginx port not already bound
+    if manifest:
+        nginx_port = manifest["nginx"]["port"]
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        result = sock.connect_ex(("127.0.0.1", nginx_port))
+        sock.close()
+        if result == 0:
+            print_fail(f"Port {nginx_port} is already in use on the host")
+            failed += 1
+        else:
+            print_ok(f"Nginx port {nginx_port} is available")
+            passed += 1
+
+    # Check 5: nginx.conf is syntactically valid
+    if os.path.exists(NGINX_CONF_OUT):
+        result = run(
+            ["docker", "run", "--rm",
+             "-v", f"{os.getcwd()}/{NGINX_CONF_OUT}:/etc/nginx/conf.d/default.conf:ro",
+             "nginx:latest", "nginx", "-t"],
+            check=False,
+            capture=True,
+        )
+        if result.returncode == 0:
+            print_ok("nginx.conf is syntactically valid")
+            passed += 1
+        else:
+            print_fail(f"nginx.conf has syntax errors:\n{result.stderr}")
+            failed += 1
+    else:
+        print_fail(f"{NGINX_CONF_OUT} not found. Run: swiftdeploy init")
+        failed += 1
+
+    print(f"\nValidation complete: {passed} passed, {failed} failed")
+
+    if failed > 0:
+        sys.exit(1)
+
+
+def wait_for_health(port: int, path: str = "/healthz", timeout: int = HEALTH_TIMEOUT) -> bool:
+    """
+    Poll the health endpoint until it returns 200 or timeout expires.
+    Returns True if healthy, False if timed out.
+    """
+    url = f"http://localhost:{port}{path}"
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            resp = requests.get(url, timeout=3)
+            if resp.status_code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
+
+
+def cmd_deploy(args):
+    """
+    Run init, bring up the stack, block until health checks pass or 60s timeout.
+    """
+    print("Running deploy...")
+
+    # Step 1: Generate configs
+    cmd_init(args)
+
+    # Step 2: Build the image first
+    manifest = load_manifest()
+    image = manifest["services"]["image"]
+    print(f"Building image {image}...")
+    run(["docker", "build", "-t", image, "app/"])
+    print("Image built successfully.")
+
+    # Step 3: Bring up the stack
+    print("Starting stack...")
+    run(["docker", "compose", "up", "-d"])
+
+    # Step 4: Wait for health checks
+    nginx_port = manifest["nginx"]["port"]
+    print(f"Waiting for health checks on port {nginx_port}...")
+    healthy = wait_for_health(nginx_port)
+
+    if healthy:
+        print(f"Stack is healthy. Service available at http://localhost:{nginx_port}")
+    else:
+        print(f"[ERROR] Health check timed out after {HEALTH_TIMEOUT}s")
+        print("Check logs with: docker compose logs")
+        sys.exit(1)
+
+
+def cmd_promote(args):
+    """
+    Switch deployment mode between stable and canary.
+
+    Steps:
+    1. Update mode field in manifest.yaml
+    2. Regenerate docker-compose.yml with new MODE env var
+    3. Restart the service container only
+    4. Confirm new mode is active via /healthz
+    """
+    target_mode = args.mode.lower()
+    if target_mode not in ("stable", "canary"):
+        print(f"[ERROR] Invalid mode '{target_mode}'. Use 'stable' or 'canary'.")
+        sys.exit(1)
+
+    print(f"Promoting to {target_mode} mode...")
+
+    # Step 1: Update manifest
+    manifest = load_manifest()
+    current_mode = manifest["services"].get("mode", "stable")
+
+    if current_mode == target_mode:
+        print(f"Already in {target_mode} mode. Nothing to do.")
+        return
+
+    manifest["services"]["mode"] = target_mode
+    save_manifest(manifest)
+    print(f"  Updated manifest.yaml: mode = {target_mode}")
+
+    # Step 2: Regenerate docker-compose.yml
+    context = get_template_context(manifest)
+    compose_content = render_template("docker-compose.yml.j2", context)
+    with open(COMPOSE_OUT, "w") as f:
+        f.write(compose_content)
+    print(f"  Regenerated {COMPOSE_OUT}")
+
+    # Step 3: Restart service container only (not nginx)
+    print(f"  Restarting {SERVICE_NAME} container...")
+    run(["docker", "compose", "up", "-d", "--no-deps", "--force-recreate", SERVICE_NAME])
+
+    # Step 4: Wait for health check to confirm new mode
+    manifest = load_manifest()
+    nginx_port = manifest["nginx"]["port"]
+    print(f"  Waiting for health check...")
+    healthy = wait_for_health(nginx_port)
+
+    if not healthy:
+        print(f"[ERROR] Health check failed after promote. Rolling back...")
+        manifest["services"]["mode"] = current_mode
+        save_manifest(manifest)
+        context = get_template_context(manifest)
+        compose_content = render_template("docker-compose.yml.j2", context)
+        with open(COMPOSE_OUT, "w") as f:
+            f.write(compose_content)
+        run(["docker", "compose", "up", "-d", "--no-deps", "--force-recreate", SERVICE_NAME])
+        sys.exit(1)
+
+    # Confirm mode via /healthz
+    url = f"http://localhost:{nginx_port}/healthz"
+    resp = requests.get(url, timeout=5)
+    data = resp.json()
+    active_mode = data.get("mode", "unknown")
+
+    if active_mode == target_mode:
+        print(f"Promotion successful. Service is running in {active_mode} mode.")
+        print(f"  /healthz response: {data}")
+    else:
+        print(f"[WARNING] Service reports mode '{active_mode}', expected '{target_mode}'")
+
+
+def cmd_teardown(args):
+    """
+    Remove all containers, networks, and volumes.
+    --clean also deletes generated config files.
+    """
+    print("Running teardown...")
+
+    run(["docker", "compose", "down", "--volumes", "--remove-orphans"], check=False)
+    print("  Containers, networks, and volumes removed.")
+
+    if args.clean:
+        for f in [NGINX_CONF_OUT, COMPOSE_OUT]:
+            if os.path.exists(f):
+                os.remove(f)
+                print(f"  Deleted {f}")
+        print("  Generated configs cleaned.")
+
+    print("Teardown complete.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="swiftdeploy",
+        description="Declarative container deployment CLI",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # init
+    subparsers.add_parser("init", help="Generate nginx.conf and docker-compose.yml from manifest")
+
+    # validate
+    subparsers.add_parser("validate", help="Run 5 pre-flight checks")
+
+    # deploy
+    subparsers.add_parser("deploy", help="Init, build, and bring up the stack")
+
+    # promote
+    promote_parser = subparsers.add_parser("promote", help="Switch deployment mode")
+    promote_parser.add_argument("mode", choices=["stable", "canary"], help="Target mode")
+
+    # teardown
+    teardown_parser = subparsers.add_parser("teardown", help="Remove all containers and volumes")
+    teardown_parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Also delete generated config files",
+    )
+
+    args = parser.parse_args()
+
+    commands = {
+        "init": cmd_init,
+        "validate": cmd_validate,
+        "deploy": cmd_deploy,
+        "promote": cmd_promote,
+        "teardown": cmd_teardown,
+    }
+
+    commands[args.command](args)
+
+
+if __name__ == "__main__":
+    main()

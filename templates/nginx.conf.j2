@@ -1,0 +1,55 @@
+upstream app_backend {
+    server {{ service_name }}:{{ services.port }};
+}
+
+log_format swiftdeploy '$time_iso8601 | $status | ${request_time}s | $upstream_addr | $request';
+
+server {
+    listen {{ nginx.port }};
+    server_name _;
+
+    access_log /var/log/nginx/access.log swiftdeploy;
+    error_log /var/log/nginx/error.log warn;
+
+    # Add swiftdeploy header to all responses
+    add_header X-Deployed-By swiftdeploy always;
+
+    # Forward X-Mode from upstream
+    proxy_pass_header X-Mode;
+
+    # Proxy timeouts
+    proxy_connect_timeout {{ nginx.proxy_timeout }}s;
+    proxy_send_timeout {{ nginx.proxy_timeout }}s;
+    proxy_read_timeout {{ nginx.proxy_timeout }}s;
+
+    location / {
+        proxy_pass http://app_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # JSON error bodies for gateway errors
+    error_page 502 = @error502;
+    error_page 503 = @error503;
+    error_page 504 = @error504;
+
+    location @error502 {
+        default_type application/json;
+        add_header X-Deployed-By swiftdeploy always;
+        return 502 '{"error":"Bad Gateway","code":502,"service":"{{ service_name }}","contact":"ops@swiftdeploy.io"}';
+    }
+
+    location @error503 {
+        default_type application/json;
+        add_header X-Deployed-By swiftdeploy always;
+        return 503 '{"error":"Service Unavailable","code":503,"service":"{{ service_name }}","contact":"ops@swiftdeploy.io"}';
+    }
+
+    location @error504 {
+        default_type application/json;
+        add_header X-Deployed-By swiftdeploy always;
+        return 504 '{"error":"Gateway Timeout","code":504,"service":"{{ service_name }}","contact":"ops@swiftdeploy.io"}';
+    }
+}

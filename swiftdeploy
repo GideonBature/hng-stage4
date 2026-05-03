@@ -206,9 +206,18 @@ def cmd_validate(args):
 
     # Check 5: nginx.conf is syntactically valid
     if os.path.exists(NGINX_CONF_OUT):
+        # Replace upstream hostname with 127.0.0.1 for syntax check only
+        with open(NGINX_CONF_OUT, "r") as f:
+            content = f.read()
+        test_content = content.replace(
+            f"{SERVICE_NAME}:", "127.0.0.1:"
+        )
+        test_path = "/tmp/swiftdeploy-nginx-test.conf"
+        with open(test_path, "w") as f:
+            f.write(test_content)
         result = run(
             ["docker", "run", "--rm",
-             "-v", f"{os.getcwd()}/{NGINX_CONF_OUT}:/etc/nginx/conf.d/default.conf:ro",
+             "-v", f"{test_path}:/etc/nginx/conf.d/default.conf:ro",
              "nginx:latest", "nginx", "-t"],
             check=False,
             capture=True,

@@ -64,8 +64,6 @@ def render_template(template_name: str, context: dict) -> str:
     """Render a Jinja2 template with the given context."""
     env = Environment(
         loader=FileSystemLoader(TEMPLATES_DIR),
-        trim_blocks=True,
-        lstrip_blocks=True,
     )
     template = env.get_template(template_name)
     return template.render(**context)

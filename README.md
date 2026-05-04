@@ -8,7 +8,7 @@ The manifest is the single source of truth. Nothing is handwritten. The grader c
 
 ## Live Repository
 
-[https://github.com/GideonBature/hng-stage4](https://github.com/GideonBature/hng-stage4)
+[https://github.com/GideonBature/hng-stage4a](https://github.com/GideonBature/hng-stage4a)
 
 ---
 
@@ -55,8 +55,8 @@ docker --version
 ### Step 2: Clone the repository
 
 ```bash
-git clone https://github.com/GideonBature/hng-stage4.git
-cd hng-stage4
+git clone https://github.com/GideonBature/hng-stage4a.git
+cd hng-stage4a
 ```
 
 ### Step 3: Install CLI dependencies

@@ -1,8 +1,8 @@
+log_format swiftdeploy '$time_iso8601 | $status | ${request_time}s | $upstream_addr | $request';
+
 upstream app_backend {
     server {{ service_name }}:{{ services.port }};
-}
-
-log_format swiftdeploy '$time_iso8601 | $status | ${request_time}s | $upstream_addr | $request';
+};
 
 server {
     listen {{ nginx.port }};
